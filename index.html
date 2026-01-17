@@ -1195,21 +1195,21 @@
     actx.restore();
   }
 
-  // --- DRAW LOOP (throttled with rAF) ---
-  let needsRedraw = true;
-  function requestDraw() {
-    if (!needsRedraw) {
-      needsRedraw = true;
-      requestAnimationFrame(drawFrame);
-    }
-  }
+  // --- DRAW LOOP (throttled with rAF) --- 
+let needsRedraw = false;
 
-  function drawFrame() {
-    if (!needsRedraw) return;
-    needsRedraw = false;
-    draw();
-    drawMiniMap();
-  }
+function requestDraw() {
+  if (needsRedraw) return;          // already scheduled
+  needsRedraw = true;
+  requestAnimationFrame(drawFrame);
+}
+
+function drawFrame() {
+  needsRedraw = false;
+  draw();
+  drawMiniMap();
+}
+
 
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
