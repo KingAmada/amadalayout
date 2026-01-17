@@ -1,0 +1,878 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Car, Ruler, Maximize, ZoomIn, ZoomOut, Info, Map as MapIcon, Home, Layout, Trees, Building2, Umbrella, Settings, Sliders, Crown, X, BedDouble, Utensils, Armchair } from 'lucide-react';
+
+// --- CONSTANTS & CONFIGURATION ---
+// 1 Unit = 1 Meter
+const LAND_WIDTH_M = 280;
+const LAND_HEIGHT_M = 420;
+
+// Boundary Coordinates
+const BOUNDARY = {
+  tl: { x: 10, y: 10 },              // Top Left
+  tr: { x: 257, y: 10 },             // Top Right (Width 247)
+  br: { x: 230, y: 409 },            // Bottom Right
+  bl: { x: 10, y: 377 }              // Bottom Left
+};
+
+const TOTAL_AREA_SQM = 93000; // ~9.3 Hectares
+
+// Colors
+const COLORS = {
+  grass: '#f0fdf4',
+  boundary: '#15803d',
+  road: '#374151',
+  roadMarking: '#f3f4f6',
+  residential: '#bfdbfe',
+  residentialHighlight: '#60a5fa',
+  mansion: '#c4b5fd', // Purple tint for luxury
+  mansionHighlight: '#a78bfa',
+  commercial: '#fca5a5',
+  commercialHighlight: '#f87171',
+  resort: '#fde68a',
+  school: '#ddd6fe',
+  park: '#86efac',
+  water: '#7dd3fc',
+  car: '#ef4444'
+};
+
+// --- HELPER CLASSES ---
+
+class Rectangle {
+  constructor(x, y, w, h, type, label, details = {}) {
+    this.x = x;
+    this.y = y;
+    this.w = w;
+    this.h = h;
+    this.type = type; 
+    this.label = label;
+    this.details = details; 
+  }
+
+  contains(mx, my) {
+    return mx >= this.x && mx <= this.x + this.w && my >= this.y && my <= this.y + this.h;
+  }
+}
+
+// --- MAIN COMPONENT ---
+
+export default function App() {
+  // State
+  const canvasRef = useRef(null);
+  const [scale, setScale] = useState(1.8); 
+  const [offset, setOffset] = useState({ x: 40, y: 40 }); 
+  const [hoveredItem, setHoveredItem] = useState(null);
+  const [showGrid, setShowGrid] = useState(true);
+  const [carPosition, setCarPosition] = useState({ x: 140, y: 380, rotation: 0 }); 
+  const [isDraggingCar, setIsDraggingCar] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
+  const [activeTab, setActiveTab] = useState('config'); 
+  
+  // Interaction State
+  const clickStartPos = useRef({ x: 0, y: 0 });
+  const [selectedLot, setSelectedLot] = useState(null);
+
+  // --- CONFIGURATION STATE ---
+  const [config, setConfig] = useState({
+    // Infrastructure
+    mainRoadWidth: 16,
+    resStreetWidth: 12,
+    resRoundaboutRadius: 8,
+    
+    // Residential (Row Houses)
+    houseWidth: 15,  
+    houseDepth: 18, 
+
+    // Mansion (End of Street)
+    mansionWidth: 22,
+    mansionDepth: 25,
+    
+    // Amenities (W = Horizontal, L/D = Vertical)
+    waterWidth: 90,
+    waterDepth: 80,
+    
+    resortWidth: 90,
+    resortDepth: 50,
+    
+    parkWidth: 90,
+    parkDepth: 90,
+    
+    schoolWidth: 90,
+    schoolDepth: 40,
+    
+    mallWidth: 90,
+    mallDepth: 60,
+    
+    mallParkingWidth: 90,
+    mallParkingDepth: 20
+  });
+
+  // --- MATH HELPERS FOR BOUNDARIES ---
+  const getRightBoundaryX = (y) => {
+    // Line from tr (257, 10) to br (230, 409)
+    const x1 = BOUNDARY.tr.x, y1 = BOUNDARY.tr.y;
+    const x2 = BOUNDARY.br.x, y2 = BOUNDARY.br.y;
+    return x1 + (y - y1) * (x2 - x1) / (y2 - y1);
+  };
+
+  const getBottomBoundaryY = (x) => {
+    // Line from bl (10, 377) to br (230, 409)
+    const x1 = BOUNDARY.bl.x, y1 = BOUNDARY.bl.y;
+    const x2 = BOUNDARY.br.x, y2 = BOUNDARY.br.y;
+    if (x2 === x1) return y1;
+    return y1 + (x - x1) * (y2 - y1) / (x2 - x1);
+  };
+  
+  // Layout Data Generation
+  const layoutData = useMemo(() => {
+    const elements = [];
+    const mainRoadWidth = Number(config.mainRoadWidth);
+    const houseWidth = Number(config.houseWidth);
+    const houseDepth = Number(config.houseDepth);
+    const resStreetWidth = Number(config.resStreetWidth);
+    const mansionWidth = Number(config.mansionWidth);
+    const mansionDepth = Number(config.mansionDepth);
+    
+    // --- 1. DYNAMIC MAIN ROAD POSITIONING ---
+    const leftMargin = 5; 
+    // Calculate required width: Mansion + Buffer + (7 * House)
+    const requiredHousingWidth = mansionWidth + 5 + (7 * houseWidth);
+    
+    // Allow main road to push right, but keep at least 60m for amenities
+    const maxMainRoadX = 220; 
+    const calculatedMainRoadX = leftMargin + requiredHousingWidth + 5; 
+    const mainRoadX = Math.min(maxMainRoadX, Math.max(140, calculatedMainRoadX));
+    
+    const mainRoadHeight = getBottomBoundaryY(mainRoadX + mainRoadWidth/2) - 10;
+
+    // Spine Road
+    elements.push(new Rectangle(mainRoadX, 10, mainRoadWidth, mainRoadHeight, 'road', 'Main Boulevard', { width: mainRoadWidth }));
+
+    // --- 2. LEFT SIDE: RESIDENTIAL (5 Streets) ---
+    const resZoneCenterX = (leftMargin + mainRoadX) / 2;
+    const resZoneBottomY = getBottomBoundaryY(resZoneCenterX);
+    const resZoneTopY = 20;
+    const availableResHeight = resZoneBottomY - resZoneTopY;
+
+    // Calculate Required Height vs Available
+    const rowHouseBlockHeight = (houseDepth * 2) + resStreetWidth;
+    const singleBlockHeight = Math.max(rowHouseBlockHeight, mansionDepth);
+    const totalRequiredHeight = 5 * singleBlockHeight;
+    
+    // Distribute Gaps
+    let blockGap = 10; 
+    if (totalRequiredHeight > availableResHeight) {
+        blockGap = 0; 
+    } else {
+        blockGap = (availableResHeight - totalRequiredHeight) / 6; 
+    }
+    
+    const raboutRadius = Number(config.resRoundaboutRadius);
+
+    for (let i = 0; i < 5; i++) {
+        // Dynamic Y calculation
+        const blockStartY = resZoneTopY + blockGap + (i * (singleBlockHeight + blockGap));
+        const streetY = blockStartY + houseDepth;
+        
+        // Stop generating if we passed the bottom boundary
+        if (blockStartY + singleBlockHeight > resZoneBottomY) break;
+
+        // 1. Street Roundabout (Right side)
+        elements.push(new Rectangle(mainRoadX - raboutRadius + mainRoadWidth/2, streetY + resStreetWidth/2 - raboutRadius, raboutRadius*2, raboutRadius*2, 'roundabout', `Circle ${i+1}`, { radius: raboutRadius }));
+
+        // 2. Mansion (Left Side / End of Street)
+        const streetCenterY = streetY + resStreetWidth/2;
+        const mansionY = streetCenterY - (mansionDepth / 2);
+        
+        elements.push(new Rectangle(leftMargin, mansionY, mansionWidth, mansionDepth, 'mansion', `Mansion ${i+1}`, {
+            zoning: 'residential',
+            area: mansionWidth * mansionDepth,
+            dim: `${mansionWidth}x${mansionDepth}m`
+        }));
+
+        // 3. Street
+        const streetStartX = leftMargin + mansionWidth;
+        const streetEndX = mainRoadX - raboutRadius + mainRoadWidth/2;
+        elements.push(new Rectangle(streetStartX, streetY, streetEndX - streetStartX, resStreetWidth, 'road', `Residential St ${i+1}`, { width: resStreetWidth }));
+        
+        // 4. Houses Top
+        const rowHouseStartX = streetStartX + 2; 
+        for(let h=0; h<7; h++) {
+            const hx = rowHouseStartX + (h * houseWidth);
+            if (hx + houseWidth > streetEndX - 2) break; 
+            
+            elements.push(new Rectangle(hx + 1, blockStartY, houseWidth - 2, houseDepth, 'lot', `Unit ${i+1}A-${h+1}`, { 
+                zoning: 'residential', 
+                area: (houseWidth-2)*houseDepth,
+                dim: `${houseWidth-2}x${houseDepth}m`
+            }));
+        }
+
+        // 5. Houses Bottom
+        for(let h=0; h<7; h++) {
+            const hx = rowHouseStartX + (h * houseWidth);
+            if (hx + houseWidth > streetEndX - 2) break; 
+            
+            elements.push(new Rectangle(hx + 1, streetY + resStreetWidth, houseWidth - 2, houseDepth, 'lot', `Unit ${i+1}B-${h+1}`, { 
+                zoning: 'residential',
+                area: (houseWidth-2)*houseDepth,
+                dim: `${houseWidth-2}x${houseDepth}m`
+            }));
+        }
+    }
+
+    // --- 3. RIGHT SIDE: AMENITIES ---
+    const rightZoneX = mainRoadX + mainRoadWidth;
+    
+    const amTopY = 20;
+    const amBottomY = getBottomBoundaryY(rightZoneX + 40) - 10;
+    const availableAmHeight = amBottomY - amTopY;
+
+    // Collect Dimensions
+    const dims = [
+        { h: Number(config.waterDepth), w: Number(config.waterWidth), type: 'water', label: 'Lagoon', zoning: 'water' },
+        { h: Number(config.resortDepth), w: Number(config.resortWidth), type: 'building', label: 'Resort', zoning: 'resort' },
+        { h: Number(config.parkDepth), w: Number(config.parkWidth), type: 'park', label: 'Park/Golf', zoning: 'park' },
+        { h: Number(config.schoolDepth), w: Number(config.schoolWidth), type: 'building', label: 'School', zoning: 'school' },
+        { h: Number(config.mallDepth), w: Number(config.mallWidth), type: 'building', label: 'Mall', zoning: 'commercial' },
+        { h: Number(config.mallParkingDepth), w: Number(config.mallParkingWidth), type: 'road', label: 'Parking', zoning: 'parking' }
+    ];
+
+    const totalAmHeight = dims.reduce((acc, d) => acc + d.h, 0);
+    
+    // Calculate Dynamic Gap
+    let amGap = 10; 
+    if (totalAmHeight > availableAmHeight) {
+        amGap = 0; // Squeeze
+    } else {
+        amGap = (availableAmHeight - totalAmHeight) / 5;
+    }
+
+    // Generator Loop
+    let currentY = amTopY;
+    
+    dims.forEach(d => {
+        const currentMaxX = getRightBoundaryX(currentY + d.h/2);
+        const availableW = (currentMaxX - rightZoneX) - 5;
+        const finalW = Math.min(d.w, availableW);
+        elements.push(new Rectangle(rightZoneX + 2, currentY, finalW, d.h, d.type, d.label, { zoning: d.zoning, area: finalW * d.h }));
+        currentY += d.h + amGap;
+    });
+
+    return elements;
+  }, [config]); 
+
+  // --- CANVAS RENDERING ---
+
+  const draw = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    
+    // Clear Canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ctx.save();
+    ctx.translate(offset.x, offset.y);
+    ctx.scale(scale, scale);
+
+    // 1. Draw Property Boundary
+    ctx.beginPath();
+    ctx.moveTo(BOUNDARY.tl.x, BOUNDARY.tl.y);
+    ctx.lineTo(BOUNDARY.tr.x, BOUNDARY.tr.y);
+    ctx.lineTo(BOUNDARY.br.x, BOUNDARY.br.y);
+    ctx.lineTo(BOUNDARY.bl.x, BOUNDARY.bl.y);
+    ctx.closePath();
+    
+    ctx.fillStyle = COLORS.grass;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.boundary;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Dimensions Labels
+    ctx.fillStyle = '#166534';
+    ctx.font = '4px Arial';
+    ctx.fillText('Back: 247m', 120, 8);
+    ctx.fillText('Front: 207m', 100, 415);
+    ctx.save();
+    ctx.translate(5, 200);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('Side: 367m', 0, 0);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(265, 200);
+    ctx.rotate(Math.PI/2);
+    ctx.fillText('Side: 399m', 0, 0);
+    ctx.restore();
+
+    // 2. Grid
+    if (showGrid) {
+      ctx.beginPath();
+      ctx.strokeStyle = '#d1d5db';
+      ctx.lineWidth = 0.1;
+      for (let i = 0; i <= LAND_WIDTH_M; i+=10) {
+        ctx.moveTo(i, 0);
+        ctx.lineTo(i, LAND_HEIGHT_M);
+      }
+      for (let i = 0; i <= LAND_HEIGHT_M; i+=10) {
+        ctx.moveTo(0, i);
+        ctx.lineTo(LAND_WIDTH_M, i);
+      }
+      ctx.stroke();
+    }
+
+    // 3. Elements
+    layoutData.forEach(el => {
+      if (el.type === 'road') {
+        ctx.fillStyle = COLORS.road;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        ctx.beginPath();
+        ctx.strokeStyle = COLORS.roadMarking;
+        ctx.setLineDash([2, 4]);
+        ctx.lineWidth = 0.3;
+        if (el.w > el.h) { 
+          ctx.moveTo(el.x, el.y + el.h/2);
+          ctx.lineTo(el.x + el.w, el.y + el.h/2);
+        } else {
+          ctx.moveTo(el.x + el.w/2, el.y);
+          ctx.lineTo(el.x + el.w/2, el.y + el.h);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } 
+      else if (el.type === 'roundabout') {
+        ctx.fillStyle = COLORS.road;
+        ctx.beginPath();
+        const r = el.w / 2;
+        ctx.arc(el.x + r, el.y + r, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = COLORS.grass;
+        ctx.beginPath();
+        ctx.arc(el.x + r, el.y + r, r * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      else if (el.type === 'lot') {
+        const isHovered = hoveredItem === el;
+        ctx.fillStyle = isHovered ? COLORS.residentialHighlight : COLORS.residential;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        const margin = 2;
+        if (el.w > margin*2 && el.h > margin*2) {
+          ctx.fillRect(el.x + margin, el.y + margin, el.w - margin*2, el.h - margin*2);
+        }
+      }
+      else if (el.type === 'mansion') {
+        const isHovered = hoveredItem === el;
+        ctx.fillStyle = isHovered ? COLORS.mansionHighlight : COLORS.mansion;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        // Roof detail (cross)
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(0,0,0,0.1)';
+        ctx.lineWidth = 0.5;
+        ctx.moveTo(el.x, el.y);
+        ctx.lineTo(el.x + el.w, el.y + el.h);
+        ctx.moveTo(el.x + el.w, el.y);
+        ctx.lineTo(el.x, el.y + el.h);
+        ctx.stroke();
+      }
+      else if (el.type === 'building') {
+        const isHovered = hoveredItem === el;
+        if (el.details.zoning === 'commercial') ctx.fillStyle = isHovered ? COLORS.commercialHighlight : COLORS.commercial;
+        if (el.details.zoning === 'school') ctx.fillStyle = COLORS.school;
+        if (el.details.zoning === 'resort') ctx.fillStyle = COLORS.resort;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        // Label
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.font = '3px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(el.label, el.x + el.w/2, el.y + el.h/2);
+      }
+      else if (el.type === 'park') {
+        ctx.fillStyle = COLORS.park;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        ctx.fillStyle = '#15803d';
+        for(let i=0; i<15; i++) {
+            ctx.beginPath();
+            ctx.arc(el.x + Math.random()*el.w, el.y + Math.random()*el.h, 1.5, 0, Math.PI*2);
+            ctx.fill();
+        }
+      }
+      else if (el.type === 'water') {
+        ctx.fillStyle = COLORS.water;
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 0.5;
+        for(let i=0; i<5; i++) {
+           ctx.beginPath();
+           const waveY = el.y + 10 + (i * 10);
+           ctx.moveTo(el.x, waveY);
+           ctx.bezierCurveTo(el.x + el.w/3, waveY-5, el.x + 2*el.w/3, waveY+5, el.x + el.w, waveY);
+           ctx.stroke();
+        }
+      }
+    });
+
+    if (hoveredItem && hoveredItem.type !== 'roundabout') {
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(hoveredItem.x, hoveredItem.y, hoveredItem.w, hoveredItem.h);
+    }
+
+    ctx.save();
+    ctx.translate(carPosition.x, carPosition.y);
+    ctx.rotate((carPosition.rotation * Math.PI) / 180);
+    ctx.fillStyle = COLORS.car;
+    const carLen = 4.5;
+    const carWid = 1.8;
+    ctx.fillRect(-carLen/2, -carWid/2, carLen, carWid);
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillRect(-carLen/4, -carWid/2 + 0.2, carLen/2, carWid - 0.4);
+    ctx.restore();
+
+    ctx.restore();
+  };
+
+  useEffect(() => {
+    draw();
+  }, [scale, offset, hoveredItem, showGrid, carPosition, layoutData]);
+
+  // --- HANDLERS ---
+  const handleMouseDown = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    // Store click start for hit detection (vs drag)
+    clickStartPos.current = { x: e.clientX, y: e.clientY };
+    
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const mx = ((e.clientX - rect.left) * scaleX - offset.x) / scale;
+    const my = ((e.clientY - rect.top) * scaleY - offset.y) / scale;
+
+    const distToCar = Math.sqrt(Math.pow(mx - carPosition.x, 2) + Math.pow(my - carPosition.y, 2));
+    if (distToCar < 8) {
+      setIsDraggingCar(true);
+      return;
+    }
+    setIsPanning(true);
+    setLastMousePos({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleMouseMove = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const mouseX = (e.clientX - rect.left) * scaleX;
+    const mouseY = (e.clientY - rect.top) * scaleY;
+    const worldX = (mouseX - offset.x) / scale;
+    const worldY = (mouseY - offset.y) / scale;
+
+    if (isDraggingCar) {
+      setCarPosition({ ...carPosition, x: worldX, y: worldY });
+      return;
+    }
+    if (isPanning) {
+      const dx = (e.clientX - lastMousePos.x) * scaleX; 
+      const dy = (e.clientY - lastMousePos.y) * scaleY;
+      setOffset({ x: offset.x + dx, y: offset.y + dy });
+      setLastMousePos({ x: e.clientX, y: e.clientY });
+      return;
+    }
+    
+    let found = null;
+    for (let i = layoutData.length - 1; i >= 0; i--) {
+      if (layoutData[i].contains(worldX, worldY)) {
+        found = layoutData[i];
+        break;
+      }
+    }
+    setHoveredItem(found);
+  };
+
+  const handleMouseUp = (e) => {
+    // Detect Click vs Drag
+    const dx = e.clientX - clickStartPos.current.x;
+    const dy = e.clientY - clickStartPos.current.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    
+    if (dist < 5 && !isDraggingCar) {
+       // Click logic
+       if (hoveredItem && (hoveredItem.type === 'lot' || hoveredItem.type === 'mansion')) {
+           setSelectedLot(hoveredItem);
+       }
+    }
+
+    setIsDraggingCar(false);
+    setIsPanning(false);
+  };
+
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const newScale = Math.max(0.5, Math.min(10, scale - e.deltaY * 0.005));
+    setScale(newScale);
+  };
+
+  const handleConfigChange = (key, value) => {
+    setConfig(prev => ({ ...prev, [key]: Number(value) }));
+  };
+
+  // --- STATS ---
+  const stats = useMemo(() => {
+    const s = { residential: 0, road: 0, commercial: 0, green: 0, public: 0 };
+    layoutData.forEach(el => {
+      const area = el.w * el.h;
+      if (el.type === 'lot' || el.type === 'mansion') s.residential += area;
+      else if (el.type === 'road' || el.type === 'roundabout') s.road += area;
+      else if (el.details.zoning === 'commercial' || el.details.zoning === 'resort') s.commercial += area;
+      else if (el.details.zoning === 'school') s.public += area;
+      else if (el.type === 'park' || el.type === 'water') s.green += area;
+    });
+    return s;
+  }, [layoutData]);
+
+  return (
+    <div className="flex h-screen w-full bg-gray-100 font-sans overflow-hidden">
+      
+      {/* SIDEBAR */}
+      <div className="w-96 bg-white shadow-xl z-10 flex flex-col h-full border-r border-gray-200">
+        <div className="p-4 border-b border-gray-200 bg-slate-50">
+          <h1 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+            <Layout className="w-6 h-6 text-blue-600" />
+            Urban Layout AI
+          </h1>
+          <div className="flex gap-2 mt-4">
+            <button 
+              onClick={() => setActiveTab('config')} 
+              className={`flex-1 py-1.5 text-xs font-semibold rounded flex items-center justify-center gap-2 ${activeTab === 'config' ? 'bg-blue-600 text-white shadow' : 'bg-gray-200 text-gray-600 hover:bg-gray-300'}`}>
+              <Settings size={14} /> Edit Dimensions
+            </button>
+            <button 
+              onClick={() => setActiveTab('stats')} 
+              className={`flex-1 py-1.5 text-xs font-semibold rounded flex items-center justify-center gap-2 ${activeTab === 'stats' ? 'bg-blue-600 text-white shadow' : 'bg-gray-200 text-gray-600 hover:bg-gray-300'}`}>
+              <Info size={14} /> Analytics
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+          
+          {activeTab === 'config' ? (
+            <div className="space-y-6">
+              {/* CONFIG INPUTS */}
+              <div className="space-y-3">
+                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                  <MapIcon size={12} /> Infrastructure (Meters)
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  <InputGroup label="Main Blvd Width" value={config.mainRoadWidth} onChange={(v) => handleConfigChange('mainRoadWidth', v)} />
+                  <InputGroup label="Res. Street Width" value={config.resStreetWidth} onChange={(v) => handleConfigChange('resStreetWidth', v)} />
+                  <InputGroup label="Res. Roundabout R" value={config.resRoundaboutRadius} onChange={(v) => handleConfigChange('resRoundaboutRadius', v)} />
+                </div>
+              </div>
+              <div className="h-px bg-gray-200"></div>
+              <div className="space-y-3">
+                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                  <Home size={12} /> Housing Units (Meters)
+                </h3>
+                <div className="mb-4">
+                  <span className="text-xs font-semibold text-blue-600 block mb-2">Standard Row House</span>
+                  <div className="grid grid-cols-2 gap-3">
+                    <InputGroup label="Frontage (Width)" value={config.houseWidth} onChange={(v) => handleConfigChange('houseWidth', v)} />
+                    <InputGroup label="Depth (Length)" value={config.houseDepth} onChange={(v) => handleConfigChange('houseDepth', v)} />
+                  </div>
+                </div>
+                <div className="p-3 bg-purple-50 rounded border border-purple-100">
+                   <span className="text-xs font-semibold text-purple-700 block mb-2 flex items-center gap-1"><Crown size={12}/> Street-End Maisonette</span>
+                   <div className="grid grid-cols-2 gap-3">
+                     <InputGroup label="Width" value={config.mansionWidth} onChange={(v) => handleConfigChange('mansionWidth', v)} />
+                     <InputGroup label="Depth" value={config.mansionDepth} onChange={(v) => handleConfigChange('mansionDepth', v)} />
+                   </div>
+                </div>
+              </div>
+              <div className="h-px bg-gray-200"></div>
+              <div className="space-y-3">
+                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                  <Building2 size={12} /> Amenities (Width x Length)
+                </h3>
+                <InputRow label="Lagoon/Beach" val1={config.waterWidth} k1="waterWidth" val2={config.waterDepth} k2="waterDepth" onChange={handleConfigChange} />
+                <InputRow label="Resort Hotel" val1={config.resortWidth} k1="resortWidth" val2={config.resortDepth} k2="resortDepth" onChange={handleConfigChange} />
+                <InputRow label="Park & Golf" val1={config.parkWidth} k1="parkWidth" val2={config.parkDepth} k2="parkDepth" onChange={handleConfigChange} />
+                <InputRow label="School" val1={config.schoolWidth} k1="schoolWidth" val2={config.schoolDepth} k2="schoolDepth" onChange={handleConfigChange} />
+                <InputRow label="Mall" val1={config.mallWidth} k1="mallWidth" val2={config.mallDepth} k2="mallDepth" onChange={handleConfigChange} />
+                <InputRow label="Mall Parking" val1={config.mallParkingWidth} k1="mallParkingWidth" val2={config.mallParkingDepth} k2="mallParkingDepth" onChange={handleConfigChange} />
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {/* OVERVIEW STATS */}
+              <div className="space-y-3">
+                <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Land Usage</h2>
+                <StatBar label="Residential (Left)" color="bg-blue-400" value={stats.residential} total={TOTAL_AREA_SQM} icon={<Home size={14} />} />
+                <StatBar label="Roads & Access" color="bg-slate-600" value={stats.road} total={TOTAL_AREA_SQM} icon={<MapIcon size={14} />} />
+                <StatBar label="Commercial & Resort" color="bg-red-400" value={stats.commercial} total={TOTAL_AREA_SQM} icon={<Building2 size={14} />} />
+                <StatBar label="Green & Water" color="bg-green-400" value={stats.green} total={TOTAL_AREA_SQM} icon={<Trees size={14} />} />
+                <StatBar label="Public/School" color="bg-purple-400" value={stats.public} total={TOTAL_AREA_SQM} icon={<Info size={14} />} />
+              </div>
+              {/* INSPECTOR */}
+              <div className="bg-slate-50 rounded-lg p-4 border border-slate-200 mt-4">
+                <h2 className="text-sm font-semibold text-slate-800 mb-2 flex items-center gap-2">
+                  <Info size={16} /> Inspector
+                </h2>
+                {hoveredItem ? (
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Name:</span>
+                      <span className="font-medium text-blue-700">{hoveredItem.label}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Type:</span>
+                      <span className="capitalize">{hoveredItem.type}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Dimensions:</span>
+                      <span className="font-mono text-xs text-slate-700">{hoveredItem.w.toFixed(1)}m x {hoveredItem.h.toFixed(1)}m</span>
+                    </div>
+                    <div className="flex justify-between items-center bg-blue-50 p-2 rounded border border-blue-100 mt-2">
+                      <span className="text-blue-800 font-semibold">Total Area:</span>
+                      <span className="font-mono font-bold text-blue-900">{(hoveredItem.w * hoveredItem.h).toFixed(0)} sqm</span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-2 italic flex items-center gap-1"><Layout size={10}/> Click to view layout</p>
+                  </div>
+                ) : (
+                  <p className="text-slate-400 text-sm italic">Hover over the map to inspect lots, roads, and buildings.</p>
+                )}
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {/* MAIN VIEWPORT */}
+      <div className="flex-1 relative bg-slate-200 overflow-hidden cursor-move">
+        <canvas
+          ref={canvasRef}
+          width={2400}
+          height={3000}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+          onWheel={handleWheel}
+          className="w-full h-full touch-none"
+        />
+        
+        {/* OVERLAY CONTROLS */}
+        <div className="absolute top-4 right-4 flex flex-col gap-2">
+          <button onClick={() => setScale(scale * 1.2)} className="p-2 bg-white rounded shadow hover:bg-gray-50"><ZoomIn size={20} /></button>
+          <button onClick={() => setScale(scale / 1.2)} className="p-2 bg-white rounded shadow hover:bg-gray-50"><ZoomOut size={20} /></button>
+          <button onClick={() => { setScale(1.8); setOffset({x: 40, y: 40}); }} className="p-2 bg-white rounded shadow hover:bg-gray-50" title="Reset View"><Maximize size={20} /></button>
+        </div>
+
+        <div className="absolute bottom-4 left-4 bg-white/90 backdrop-blur px-3 py-1 rounded shadow text-xs text-slate-600 pointer-events-none">
+           Drag car to check scale. Scroll to zoom. Click houses for layout.
+        </div>
+
+        {/* FLOOR PLAN MODAL */}
+        {selectedLot && (
+            <FloorPlanModal lot={selectedLot} onClose={() => setSelectedLot(null)} />
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// --- FLOOR PLAN COMPONENT ---
+
+function FloorPlanModal({ lot, onClose }) {
+    const isMansion = lot.type === 'mansion';
+    const w = lot.w;
+    const h = lot.h;
+    
+    // Scale for internal floorplan drawing
+    const maxDim = Math.max(w, h);
+    const scale = 300 / maxDim; // Fit into 300px box
+    
+    // Procedural Room Generation based on dimensions
+    const rooms = useMemo(() => {
+        const r = [];
+        
+        if (isMansion) {
+            // Mansion Layout
+            // 1. Grand Foyer (Bottom Center)
+            const foyerW = w * 0.4;
+            const foyerH = h * 0.25;
+            r.push({ x: (w-foyerW)/2, y: h-foyerH, w: foyerW, h: foyerH, name: 'Grand Foyer', color: '#f3e8ff' });
+            
+            // 2. Great Room (Center)
+            const greatW = w * 0.5;
+            const greatH = h * 0.4;
+            r.push({ x: (w-greatW)/2, y: h - foyerH - greatH, w: greatW, h: greatH, name: 'Great Room', color: '#e9d5ff' });
+            
+            // 3. Kitchen/Dining (Right Wing)
+            r.push({ x: w - (w*0.3), y: h * 0.3, w: w*0.3, h: h*0.7, name: 'Kitchen & Dining', color: '#fce7f3' });
+            
+            // 4. Master Suite (Left Wing)
+            r.push({ x: 0, y: h * 0.4, w: w*0.25, h: h*0.6, name: 'Master Suite', color: '#dbeafe' });
+            
+            // 5. Guest/Study (Top Left)
+            r.push({ x: 0, y: 0, w: w*0.4, h: h*0.4, name: 'Study/Guest', color: '#e0f2fe' });
+            
+            // 6. Terrace/Pool (Top Right)
+            r.push({ x: w*0.4, y: 0, w: w*0.6, h: h*0.3, name: 'Terrace', color: '#ecfccb', isOutdoor: true });
+
+        } else {
+            // Row House Layout
+            // 1. Garage (Bottom Left/Right depending on random, lets say Left)
+            const garageW = 3.5;
+            const garageH = 6;
+            if (w > 6) {
+                r.push({ x: 0, y: h-garageH, w: garageW, h: garageH, name: 'Garage', color: '#e5e7eb' });
+            }
+            
+            // 2. Entrance/Living (Bottom Right)
+            const livingW = w - (w > 6 ? garageW : 0);
+            r.push({ x: (w > 6 ? garageW : 0), y: h*0.5, w: livingW, h: h*0.5, name: 'Living & Dining', color: '#dbeafe' });
+            
+            // 3. Kitchen (Middle)
+            r.push({ x: 0, y: h*0.25, w: w, h: h*0.25, name: 'Kitchen', color: '#fae8ff' });
+            
+            // 4. Bedrooms (Top)
+            r.push({ x: 0, y: 0, w: w*0.5, h: h*0.25, name: 'Master Bed', color: '#d1fae5' });
+            r.push({ x: w*0.5, y: 0, w: w*0.5, h: h*0.25, name: 'Bed 2', color: '#d1fae5' });
+        }
+        return r;
+    }, [w, h, isMansion]);
+
+    return (
+        <div className="absolute inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={(e) => { if(e.target === e.currentTarget) onClose() }}>
+            <div className="bg-white rounded-lg shadow-2xl overflow-hidden max-w-lg w-full flex flex-col max-h-[90vh]">
+                
+                {/* Header */}
+                <div className={`p-4 border-b flex justify-between items-center ${isMansion ? 'bg-purple-50' : 'bg-blue-50'}`}>
+                    <div>
+                        <h3 className={`font-bold text-lg ${isMansion ? 'text-purple-900' : 'text-blue-900'}`}>{lot.label}</h3>
+                        <p className="text-xs text-gray-500">{lot.w.toFixed(1)}m x {lot.h.toFixed(1)}m | {(lot.w * lot.h).toFixed(0)} sqm</p>
+                    </div>
+                    <button onClick={onClose} className="p-2 hover:bg-black/5 rounded-full text-gray-500"><X size={20}/></button>
+                </div>
+
+                {/* Content */}
+                <div className="p-6 overflow-y-auto flex flex-col items-center">
+                    
+                    {/* Visual Floorplan */}
+                    <div className="relative border-4 border-slate-800 bg-white shadow-lg mb-6" style={{ width: w * scale, height: h * scale }}>
+                         {rooms.map((room, i) => (
+                             <div key={i} className="absolute border border-slate-300 flex items-center justify-center text-center p-1"
+                                  style={{
+                                      left: room.x * scale,
+                                      top: room.y * scale,
+                                      width: room.w * scale,
+                                      height: room.h * scale,
+                                      backgroundColor: room.color
+                                  }}>
+                                 <span className="text-[10px] font-medium leading-tight text-slate-700">{room.name}</span>
+                             </div>
+                         ))}
+                         {/* Entrance Marker */}
+                         <div className="absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-1/2 w-6 h-3 bg-slate-800 rounded-b text-[8px] text-white flex items-center justify-center">Entry</div>
+                    </div>
+
+                    {/* Stats Grid */}
+                    <div className="grid grid-cols-2 gap-4 w-full text-sm">
+                        <div className="bg-slate-50 p-3 rounded border border-slate-100">
+                             <h4 className="font-semibold text-slate-700 mb-2 flex items-center gap-2"><Utensils size={14}/> Ground Floor</h4>
+                             <ul className="space-y-1 text-slate-500 text-xs">
+                                 <li>• Open Concept Living</li>
+                                 <li>• Modern Kitchen</li>
+                                 <li>• Dining Area</li>
+                                 {isMansion && <li>• Grand Foyer</li>}
+                             </ul>
+                        </div>
+                        <div className="bg-slate-50 p-3 rounded border border-slate-100">
+                             <h4 className="font-semibold text-slate-700 mb-2 flex items-center gap-2"><BedDouble size={14}/> Private Zones</h4>
+                             <ul className="space-y-1 text-slate-500 text-xs">
+                                 <li>• Master Suite</li>
+                                 <li>• {isMansion ? '3' : '2'} Guest Bedrooms</li>
+                                 <li>• {isMansion ? '4' : '2.5'} Bathrooms</li>
+                             </ul>
+                        </div>
+                    </div>
+
+                </div>
+                
+                {/* Footer */}
+                <div className="p-4 bg-gray-50 border-t text-center">
+                    <button onClick={onClose} className="px-6 py-2 bg-slate-800 text-white rounded hover:bg-slate-700 text-sm font-medium">Close View</button>
+                </div>
+            </div>
+        </div>
+    )
+}
+
+
+// --- SUBCOMPONENTS ---
+
+function InputGroup({ label, value, onChange }) {
+    return (
+        <div className="flex flex-col">
+            <label className="text-xs text-slate-500 mb-1">{label}</label>
+            <input 
+                type="number" 
+                value={value} 
+                onChange={(e) => onChange(e.target.value)}
+                className="w-full border border-gray-300 rounded px-2 py-1 text-sm focus:border-blue-500 outline-none"
+            />
+        </div>
+    )
+}
+
+function InputRow({ label, val1, k1, val2, k2, onChange }) {
+    return (
+        <div className="flex flex-col mb-1">
+             <label className="text-xs text-slate-500 mb-1">{label}</label>
+             <div className="flex gap-2">
+                <div className="relative flex-1">
+                    <span className="absolute left-1.5 top-1 text-[10px] text-gray-400">W</span>
+                    <input 
+                        type="number" 
+                        value={val1} 
+                        onChange={(e) => onChange(k1, e.target.value)}
+                        className="w-full border border-gray-300 rounded pl-4 pr-1 py-1 text-xs focus:border-blue-500 outline-none"
+                        placeholder="W"
+                    />
+                </div>
+                <div className="relative flex-1">
+                    <span className="absolute left-1.5 top-1 text-[10px] text-gray-400">L</span>
+                    <input 
+                        type="number" 
+                        value={val2} 
+                        onChange={(e) => onChange(k2, e.target.value)}
+                        className="w-full border border-gray-300 rounded pl-4 pr-1 py-1 text-xs focus:border-blue-500 outline-none"
+                        placeholder="L"
+                    />
+                </div>
+             </div>
+        </div>
+    )
+}
+
+function StatBar({ label, value, total, color, icon }) {
+  const percent = Math.round((value / total) * 100);
+  return (
+    <div>
+      <div className="flex justify-between items-end mb-1">
+        <span className="text-xs font-medium text-slate-700 flex items-center gap-1.5">{icon} {label}</span>
+        <span className="text-xs font-bold text-slate-900">{percent}% <span className="text-slate-400 font-normal">({Math.round(value).toLocaleString()} m²)</span></span>
+      </div>
+      <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+        <div className={`h-full ${color}`} style={{ width: `${percent}%` }}></div>
+      </div>
+    </div>
+  );
+}
